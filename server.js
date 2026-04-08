@@ -528,19 +528,30 @@ function forwardSignaling(socket, payload = {}, signalType) {
   }
 
   if (signalType === 'offer') {
-    io.to(targetParticipant.socketId).emit('webrtc:offer', { roomId, senderId, sdp });
+    io.to(roomId).emit('webrtc:offer', {
+      roomId,
+      senderId,
+      targetUserId,
+      sdp,
+    });
     return;
   }
 
   if (signalType === 'answer') {
-    io.to(targetParticipant.socketId).emit('webrtc:answer', { roomId, senderId, sdp });
+    io.to(roomId).emit('webrtc:answer', {
+      roomId,
+      senderId,
+      targetUserId,
+      sdp,
+    });
     return;
   }
 
   if (signalType === 'ice-candidate') {
-    io.to(targetParticipant.socketId).emit('webrtc:ice-candidate', {
+    io.to(roomId).emit('webrtc:ice-candidate', {
       roomId,
       senderId,
+      targetUserId,
       candidate,
     });
   }
@@ -829,6 +840,18 @@ io.on('connection', (socket) => {
 
   socket.on('webrtc:leave-room', (payload) => {
     leaveRoom(socket, payload);
+  });
+
+  socket.on('webrtc:offer', (payload) => {
+    forwardSignaling(socket, payload, 'offer');
+  });
+
+  socket.on('webrtc:answer', (payload) => {
+    forwardSignaling(socket, payload, 'answer');
+  });
+
+  socket.on('webrtc:ice-candidate', (payload) => {
+    forwardSignaling(socket, payload, 'ice-candidate');
   });
 
   // ========== EVENTOS MEDIASOUP SFU ==========
