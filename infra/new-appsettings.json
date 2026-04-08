@@ -1,0 +1,11 @@
+{
+  "CORS_ORIGIN": "https://videochat-sfu-app.azurewebsites.net",
+  "DATABASE_URL": "mongodb://Admin:admin@ac-sbqr9zr-shard-00-00.llgwoh8.mongodb.net:27017,ac-sbqr9zr-shard-00-01.llgwoh8.mongodb.net:27017,ac-sbqr9zr-shard-00-02.llgwoh8.mongodb.net:27017/videochatservice?ssl=true&authSource=admin&retryWrites=true&w=majority",
+  "ENABLE_ORYX_BUILD": "false",
+  "JWT_SECRET": "miclaveultrasecreta",
+  "LOG_LEVEL": "info",
+  "NODE_ENV": "production",
+  "SCM_DO_BUILD_DURING_DEPLOYMENT": "false",
+  "WEBSITE_HTTPLOGGING_RETENTION_DAYS": "3",
+  "WEBSITE_NODE_DEFAULT_VERSION": "20-lts"
+}

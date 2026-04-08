@@ -1,0 +1,27 @@
+# Docker Compose para desarrollo
+
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - JWT_SECRET=dev_secret_key
+      - CORS_ORIGIN=http://localhost:3000
+      - LOG_LEVEL=debug
+    volumes:
+      - ../src:/app/src
+      - ../package.json:/app/package.json
+    command: npm run dev
+    networks:
+      - videochat-network
+
+networks:
+  videochat-network:
+    driver: bridge
