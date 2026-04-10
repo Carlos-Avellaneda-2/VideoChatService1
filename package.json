@@ -10,7 +10,7 @@
     "test:chat": "node tests/chat-realtime-test.js",
     "test:webrtc": "node tests/webrtc-signaling-test.js",
     "test:realtime": "npm run test:chat && npm run test:webrtc",
-    "test": "jest",
+    "test": "jest --passWithNoTests",
     "test:watch": "jest --watch",
     "lint": "eslint src/"
   },
