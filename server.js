@@ -14,10 +14,26 @@ const mongoose = require('mongoose');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 const { v4: uuidv4 } = require('uuid');
-const mediasoup = require('mediasoup');
+const jwt = require('jsonwebtoken');
+let mediasoup = null;
+try {
+  mediasoup = require('mediasoup');
+} catch (error) {
+  console.warn('[Mediasoup] Paquete no disponible, se iniciará sin SFU:', error.message);
+}
 const Message = require('./src/models/Message');
 const Room = require('./src/models/Room');
 const User = require('./src/models/User');
+const authMiddleware = require('./src/middleware/authMiddleware');
+const {
+  GroupEventStoreError,
+  createEvent,
+  listEvents,
+  getEventById,
+  updateEventStatus,
+  enrollPatient,
+  leaveEvent,
+} = require('./src/services/groupEventStore');
 
 const app = express();
 const server = http.createServer(app);
@@ -156,6 +172,7 @@ const CHAT_MAX_MESSAGE_LENGTH = Number(process.env.CHAT_MAX_MESSAGE_LENGTH || 10
 const CHAT_RATE_LIMIT_WINDOW_MS = Number(process.env.CHAT_RATE_LIMIT_WINDOW_MS || 5000);
 const CHAT_RATE_LIMIT_MAX_MESSAGES = Number(process.env.CHAT_RATE_LIMIT_MAX_MESSAGES || 7);
 const CHAT_DUPLICATE_WINDOW_MS = Number(process.env.CHAT_DUPLICATE_WINDOW_MS || 3000);
+const SUPPORTED_ROLES = new Set(['ADMIN', 'PATIENT', 'PSYCHOLOGIST']);
 
 function normalizeId(value) {
   if (value === null || value === undefined) {
@@ -163,6 +180,237 @@ function normalizeId(value) {
   }
 
   return String(value).trim();
+}
+
+function normalizeRole(roleValue) {
+  const role = String(roleValue || '').toUpperCase();
+
+  if (role.includes('ADMIN')) {
+    return 'ADMIN';
+  }
+
+  if (role.includes('PSYCHOLOGIST') || role.includes('PSICOLOG')) {
+    return 'PSYCHOLOGIST';
+  }
+
+  if (role.includes('PATIENT') || role.includes('PACIENT')) {
+    return 'PATIENT';
+  }
+
+  return 'UNKNOWN';
+}
+
+function resolveUserId(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return '';
+  }
+
+  const candidates = [payload.userId, payload.id, payload.sub];
+  for (const candidate of candidates) {
+    const normalized = normalizeId(candidate);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return '';
+}
+
+function getAuthenticatedUser(req) {
+  const payload = req.user;
+  if (!payload) {
+    return { id: '', role: 'UNKNOWN' };
+  }
+
+  return {
+    id: resolveUserId(payload),
+    role: normalizeRole(payload.role),
+    payload,
+  };
+}
+
+function hasRole(user, allowedRoles) {
+  if (!user || !SUPPORTED_ROLES.has(user.role)) {
+    return false;
+  }
+
+  return allowedRoles.includes(user.role);
+}
+
+function formatEventForClient(event, viewer = { id: '', role: 'UNKNOWN' }) {
+  const response = {
+    id: event.id,
+    title: event.title,
+    description: event.description,
+    psychologistId: event.psychologistId,
+    psychologistName: event.psychologistName,
+    scheduledStart: event.scheduledStart,
+    scheduledEnd: event.scheduledEnd,
+    status: event.status,
+    capacity: event.capacity,
+    enrolledCount: event.enrolledCount,
+    roomId: event.roomId,
+    audience: event.audience,
+    createdAt: event.createdAt,
+    updatedAt: event.updatedAt,
+  };
+
+  if (viewer.role === 'PATIENT') {
+    const enrollment = (event.enrollments || []).find(
+      (item) => normalizeId(item.patientId) === normalizeId(viewer.id)
+    );
+
+    response.isEnrolled = Boolean(
+      enrollment && ['REGISTERED', 'JOINED'].includes(String(enrollment.status).toUpperCase())
+    );
+    response.enrollmentStatus = enrollment ? String(enrollment.status).toUpperCase() : 'NONE';
+  }
+
+  return response;
+}
+
+function buildEventNotification(type, event) {
+  const createdAt = new Date().toISOString();
+  const startLabel = event.scheduledStart
+    ? new Date(event.scheduledStart).toLocaleString('es-CO')
+    : 'próximamente';
+
+  if (type === 'LIVE') {
+    return {
+      id: `event-live-${event.id}-${Date.now()}`,
+      eventId: event.id,
+      type: 'LIVE',
+      title: 'Sesión grupal iniciada',
+      message: `${event.title} ya está en vivo.`,
+      createdAt,
+      read: false,
+    };
+  }
+
+  if (type === 'CANCELLED') {
+    return {
+      id: `event-cancelled-${event.id}-${Date.now()}`,
+      eventId: event.id,
+      type: 'CANCELLED',
+      title: 'Sesión grupal cancelada',
+      message: `${event.title} fue cancelada por el organizador.`,
+      createdAt,
+      read: false,
+    };
+  }
+
+  return {
+    id: `event-created-${event.id}-${Date.now()}`,
+    eventId: event.id,
+    type: 'CREATED',
+    title: 'Nueva sesión en grupo',
+    message: `${event.title} disponible para pacientes. Inicio: ${startLabel}`,
+    createdAt,
+    read: false,
+  };
+}
+
+function emitEventNotification(eventType, event) {
+  const notification = buildEventNotification(eventType, event);
+
+  io.to('role:PATIENT').emit('event:notification', notification);
+
+  if (eventType === 'CREATED') {
+    io.to('role:PATIENT').emit('notification:group-event-created', notification);
+  }
+
+  if (eventType === 'LIVE') {
+    io.to('role:PATIENT').emit('notification:group-event-live', notification);
+  }
+}
+
+function sendStoreError(res, error, fallbackMessage = 'Error interno') {
+  if (error instanceof GroupEventStoreError) {
+    return res.status(error.status || 400).json({ error: error.message, code: error.code });
+  }
+
+  return res.status(500).json({ error: fallbackMessage });
+}
+
+async function ensureEventRoomId(event) {
+  const existingRoomId = normalizeId(event.roomId);
+  if (existingRoomId) {
+    return existingRoomId;
+  }
+
+  if (mongoose.connection.readyState === 1) {
+    const room = await Room.create({
+      name: `Evento grupal - ${event.title}`,
+      type: 'grupo',
+      maxParticipants: Number(event.capacity || 30),
+      eventId: event.id,
+      eventType: 'GROUP_EVENT',
+      eventStatus: 'LIVE',
+      participants: [],
+    });
+
+    return String(room._id);
+  }
+
+  return `group-event-${event.id}`;
+}
+
+async function syncRoomEventStatus(event) {
+  const roomId = normalizeId(event.roomId);
+  if (!roomId) {
+    return;
+  }
+
+  if (mongoose.connection.readyState !== 1 || !mongoose.Types.ObjectId.isValid(roomId)) {
+    return;
+  }
+
+  await Room.findByIdAndUpdate(roomId, {
+    eventStatus: event.status,
+  }).catch(() => {});
+}
+
+function readTokenFromSocket(socket) {
+  const authToken = normalizeId(socket.handshake?.auth?.token);
+  if (authToken) {
+    return authToken;
+  }
+
+  const authHeader = normalizeId(socket.handshake?.headers?.authorization);
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+
+  return '';
+}
+
+function registerSocketIdentity(socket) {
+  const token = readTokenFromSocket(socket);
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    const authUser = {
+      id: resolveUserId(payload),
+      role: normalizeRole(payload.role),
+    };
+
+    socket.data.authUser = authUser;
+
+    if (authUser.id) {
+      socket.join(`user:${authUser.id}`);
+    }
+
+    if (SUPPORTED_ROLES.has(authUser.role)) {
+      socket.join(`role:${authUser.role}`);
+    }
+
+    return authUser;
+  } catch {
+    return null;
+  }
 }
 
 async function findUserForTest(idValue, emailValue, expectedRole) {
@@ -262,6 +510,10 @@ function getRoomParticipants(roomId) {
  * Inicializar el worker de Mediasoup
  */
 async function initMediasoup() {
+  if (!mediasoup) {
+    return null;
+  }
+
   try {
     mediasoupWorker = await mediasoup.createWorker({
       logLevel: 'warn',
@@ -385,7 +637,12 @@ function broadcastParticipants(roomId) {
 }
 
 async function joinRoom(socket, payload = {}) {
-  const { roomId, userId, role = 'unknown' } = payload;
+  const roomId = normalizeId(payload.roomId);
+  const payloadUserId = normalizeId(payload.userId);
+  const payloadRole = normalizeId(payload.role);
+  const authUser = socket.data.authUser || {};
+  const userId = payloadUserId || normalizeId(authUser.id);
+  const role = payloadRole || normalizeId(authUser.role) || 'unknown';
 
   if (!roomId || !userId) {
     socket.emit('chat:error', { message: 'roomId y userId son requeridos' });
@@ -727,9 +984,309 @@ app.post('/api/test/rooms', async (req, res) => {
   }
 });
 
+app.post('/api/events', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['ADMIN'])) {
+    return res.status(403).json({ error: 'Solo los administradores pueden crear eventos grupales.' });
+  }
+
+  try {
+    const created = await createEvent({
+      ...req.body,
+      createdBy: user.id,
+    });
+
+    emitEventNotification('CREATED', created);
+    return res.status(201).json(formatEventForClient(created, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo crear el evento grupal.');
+  }
+});
+
+app.get('/api/events/psychologist/agenda', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['PSYCHOLOGIST'])) {
+    return res.status(403).json({ error: 'Solo los psicólogos pueden consultar la agenda de eventos.' });
+  }
+
+  try {
+    const events = await listEvents({ psychologistId: user.id });
+    return res.json(events.map((event) => formatEventForClient(event, user)));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo obtener la agenda de eventos.');
+  }
+});
+
+app.get('/api/events/patient/offers', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['PATIENT'])) {
+    return res.status(403).json({ error: 'Solo los pacientes pueden consultar ofertas de eventos.' });
+  }
+
+  try {
+    const events = await listEvents({ onlyVisibleToPatients: true });
+    return res.json(events.map((event) => formatEventForClient(event, user)));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudieron obtener las ofertas de eventos.');
+  }
+});
+
+app.get('/api/events', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+  const statuses = normalizeId(req.query.status)
+    ? normalizeId(req.query.status)
+        .split(',')
+        .map((status) => status.trim().toUpperCase())
+        .filter(Boolean)
+    : [];
+
+  const filters = {};
+
+  if (hasRole(user, ['PSYCHOLOGIST'])) {
+    filters.psychologistId = user.id;
+  }
+
+  if (hasRole(user, ['PATIENT'])) {
+    filters.onlyVisibleToPatients = true;
+  }
+
+  if (statuses.length > 0) {
+    filters.statuses = statuses;
+  }
+
+  try {
+    const events = await listEvents(filters);
+    return res.json(events.map((event) => formatEventForClient(event, user)));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudieron listar los eventos.');
+  }
+});
+
+app.get('/api/events/:eventId', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  try {
+    const event = await getEventById(req.params.eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Evento no encontrado.' });
+    }
+
+    if (
+      hasRole(user, ['PSYCHOLOGIST']) &&
+      event.psychologistId !== user.id &&
+      !hasRole(user, ['ADMIN'])
+    ) {
+      return res.status(403).json({ error: 'No puedes acceder a eventos de otro psicólogo.' });
+    }
+
+    if (hasRole(user, ['PATIENT']) && !['SCHEDULED', 'LIVE'].includes(event.status)) {
+      const ownEnrollment = (event.enrollments || []).find(
+        (item) => normalizeId(item.patientId) === normalizeId(user.id)
+      );
+
+      if (!ownEnrollment) {
+        return res.status(403).json({ error: 'Este evento no está disponible para pacientes.' });
+      }
+    }
+
+    return res.json(formatEventForClient(event, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo obtener el evento.');
+  }
+});
+
+app.post('/api/events/:eventId/start', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['ADMIN', 'PSYCHOLOGIST'])) {
+    return res.status(403).json({ error: 'No tienes permisos para iniciar eventos.' });
+  }
+
+  try {
+    const existing = await getEventById(req.params.eventId);
+    if (!existing) {
+      return res.status(404).json({ error: 'Evento no encontrado.' });
+    }
+
+    if (user.role === 'PSYCHOLOGIST' && normalizeId(existing.psychologistId) !== normalizeId(user.id)) {
+      return res.status(403).json({ error: 'Solo el psicólogo asignado puede iniciar este evento.' });
+    }
+
+    const roomId = await ensureEventRoomId(existing);
+    const updated = await updateEventStatus(existing.id, 'LIVE', {
+      allowedFrom: ['SCHEDULED'],
+      roomId,
+    });
+
+    await syncRoomEventStatus(updated);
+
+    emitEventNotification('LIVE', updated);
+    io.to(`event:${updated.id}`).emit('event:status-updated', {
+      eventId: updated.id,
+      status: updated.status,
+      roomId: updated.roomId,
+    });
+
+    return res.json(formatEventForClient(updated, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo iniciar el evento.');
+  }
+});
+
+app.post('/api/events/:eventId/finish', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['ADMIN', 'PSYCHOLOGIST'])) {
+    return res.status(403).json({ error: 'No tienes permisos para finalizar eventos.' });
+  }
+
+  try {
+    const existing = await getEventById(req.params.eventId);
+    if (!existing) {
+      return res.status(404).json({ error: 'Evento no encontrado.' });
+    }
+
+    if (user.role === 'PSYCHOLOGIST' && normalizeId(existing.psychologistId) !== normalizeId(user.id)) {
+      return res.status(403).json({ error: 'Solo el psicólogo asignado puede finalizar este evento.' });
+    }
+
+    const updated = await updateEventStatus(existing.id, 'FINISHED', {
+      allowedFrom: ['LIVE'],
+    });
+
+    await syncRoomEventStatus(updated);
+
+    io.to(`event:${updated.id}`).emit('event:status-updated', {
+      eventId: updated.id,
+      status: updated.status,
+      roomId: updated.roomId,
+    });
+
+    return res.json(formatEventForClient(updated, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo finalizar el evento.');
+  }
+});
+
+app.post('/api/events/:eventId/cancel', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['ADMIN', 'PSYCHOLOGIST'])) {
+    return res.status(403).json({ error: 'No tienes permisos para cancelar eventos.' });
+  }
+
+  try {
+    const existing = await getEventById(req.params.eventId);
+    if (!existing) {
+      return res.status(404).json({ error: 'Evento no encontrado.' });
+    }
+
+    if (user.role === 'PSYCHOLOGIST' && normalizeId(existing.psychologistId) !== normalizeId(user.id)) {
+      return res.status(403).json({ error: 'Solo el psicólogo asignado puede cancelar este evento.' });
+    }
+
+    const updated = await updateEventStatus(existing.id, 'CANCELLED', {
+      allowedFrom: ['SCHEDULED', 'LIVE'],
+    });
+
+    await syncRoomEventStatus(updated);
+
+    emitEventNotification('CANCELLED', updated);
+    io.to(`event:${updated.id}`).emit('event:status-updated', {
+      eventId: updated.id,
+      status: updated.status,
+      roomId: updated.roomId,
+    });
+
+    return res.json(formatEventForClient(updated, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo cancelar el evento.');
+  }
+});
+
+app.post('/api/events/:eventId/enroll', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['PATIENT'])) {
+    return res.status(403).json({ error: 'Solo los pacientes pueden inscribirse en eventos.' });
+  }
+
+  try {
+    const updated = await enrollPatient(req.params.eventId, user.id);
+    io.to(`event:${updated.id}`).emit('event:enrollment-updated', {
+      eventId: updated.id,
+      enrolledCount: updated.enrolledCount,
+      capacity: updated.capacity,
+      patientId: user.id,
+      type: 'ENROLLED',
+    });
+    return res.json(formatEventForClient(updated, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo completar la inscripción.');
+  }
+});
+
+app.delete('/api/events/:eventId/enrollments/me', authMiddleware, async (req, res) => {
+  const user = getAuthenticatedUser(req);
+
+  if (!hasRole(user, ['PATIENT'])) {
+    return res.status(403).json({ error: 'Solo los pacientes pueden retirarse de un evento.' });
+  }
+
+  try {
+    const updated = await leaveEvent(req.params.eventId, user.id);
+    io.to(`event:${updated.id}`).emit('event:enrollment-updated', {
+      eventId: updated.id,
+      enrolledCount: updated.enrolledCount,
+      capacity: updated.capacity,
+      patientId: user.id,
+      type: 'LEFT',
+    });
+    return res.json(formatEventForClient(updated, user));
+  } catch (error) {
+    return sendStoreError(res, error, 'No se pudo salir del evento.');
+  }
+});
+
 // WebSocket - Socket.IO
 io.on('connection', (socket) => {
+  registerSocketIdentity(socket);
   console.log(`[Socket.IO] Cliente conectado: ${socket.id}`);
+
+  socket.on('event:subscribe', (payload = {}, callback) => {
+    const eventId = normalizeId(payload.eventId);
+    if (!eventId) {
+      const response = { ok: false, error: 'eventId es requerido' };
+      if (typeof callback === 'function') {
+        callback(response);
+      }
+      return;
+    }
+
+    socket.join(`event:${eventId}`);
+    if (typeof callback === 'function') {
+      callback({ ok: true, eventId });
+    }
+  });
+
+  socket.on('event:unsubscribe', (payload = {}, callback) => {
+    const eventId = normalizeId(payload.eventId);
+    if (!eventId) {
+      const response = { ok: false, error: 'eventId es requerido' };
+      if (typeof callback === 'function') {
+        callback(response);
+      }
+      return;
+    }
+
+    socket.leave(`event:${eventId}`);
+    if (typeof callback === 'function') {
+      callback({ ok: true, eventId });
+    }
+  });
 
   socket.on('chat:join-room', async (payload) => {
     await joinRoom(socket, payload);
@@ -1119,19 +1676,22 @@ if (process.env.DATABASE_URL) {
     });
 }
 
-// Inicializar Mediasoup y luego iniciar el servidor
+// Inicializar Mediasoup sin bloquear el arranque del API/Socket.
+// En entornos restringidos (p.ej. App Service), el binario nativo puede fallar.
 (async () => {
+  let mediasoupReady = false;
+
   try {
     await initMediasoup();
+    mediasoupReady = true;
     console.log('[Mediasoup] Worker inicializado exitosamente');
   } catch (error) {
-    console.error('[Mediasoup] No se pudo inicializar el worker:', error);
-    process.exit(1);
+    console.error('[Mediasoup] No se pudo inicializar el worker. Se iniciará en modo degradado (sin SFU):', error);
   }
 
   server.listen(PORT, () => {
     console.log(` VideoChatService (SFU) ejecutando en puerto ${PORT}`);
-    console.log(` Arquitectura: Selective Forwarding Unit (Mediasoup)`);
+    console.log(` Arquitectura: ${mediasoupReady ? 'Selective Forwarding Unit (Mediasoup)' : 'P2P/WebRTC sin SFU (modo degradado)'}`);
     console.log(` WebSocket (Socket.IO) disponible`);
     console.log(` CORS habilitado para: ${process.env.CORS_ORIGIN}`);
   });

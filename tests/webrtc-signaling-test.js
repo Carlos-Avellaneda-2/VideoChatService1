@@ -119,8 +119,10 @@ async function run() {
 }
 
 run()
-  .then(() => process.exit(0))
+  .then(() => {
+    process.exitCode = 0;
+  })
   .catch((error) => {
     console.error(`ERROR pruebas WebRTC: ${error.message}`);
-    process.exit(1);
+    process.exitCode = 1;
   });
