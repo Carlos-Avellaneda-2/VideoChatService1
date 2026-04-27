@@ -37,29 +37,11 @@ const {
 
 const app = express();
 const server = http.createServer(app);
-function isAllowedOrigin(origin) {
-  if (!origin) {
-    return true;
-  }
-
-  try {
-    const parsed = new URL(origin);
-    return ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
-  } catch {
-    return origin === process.env.CORS_ORIGIN;
-  }
-}
-
 const corsOptions = {
   origin(origin, callback) {
-    if (isAllowedOrigin(origin) || origin === process.env.CORS_ORIGIN) {
-      callback(null, true);
-      return;
-    }
-
-    callback(new Error('Not allowed by CORS'));
+    callback(null, true);
   },
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   credentials: true,
 };
 
