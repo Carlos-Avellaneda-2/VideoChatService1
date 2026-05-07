@@ -149,6 +149,10 @@ const recentMessages = new Map();
 // Mediasoup - Gestión de salas, routers y productores
 const mediasoupRoom = new Map(); // roomId -> { router, producers, consumers, transports }
 let mediasoupWorker = null;
+const MEDIASOUP_RTC_MIN_PORT = Number(process.env.MEDIASOUP_RTC_MIN_PORT || 40000);
+const MEDIASOUP_RTC_MAX_PORT = Number(process.env.MEDIASOUP_RTC_MAX_PORT || 49999);
+const MEDIASOUP_LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
+const MEDIASOUP_ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP;
 
 const CHAT_MAX_MESSAGE_LENGTH = Number(process.env.CHAT_MAX_MESSAGE_LENGTH || 1000);
 const CHAT_RATE_LIMIT_WINDOW_MS = Number(process.env.CHAT_RATE_LIMIT_WINDOW_MS || 5000);
@@ -500,8 +504,8 @@ async function initMediasoup() {
     mediasoupWorker = await mediasoup.createWorker({
       logLevel: 'warn',
       logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp', 'rtx', 'bwe', 'score', 'simulcast', 'svc'],
-      rtcMinPort: 40000,
-      rtcMaxPort: 49999,
+      rtcMinPort: MEDIASOUP_RTC_MIN_PORT,
+      rtcMaxPort: MEDIASOUP_RTC_MAX_PORT,
     });
 
     console.log(`[Mediasoup] Worker creado con PID ${mediasoupWorker.pid}`);
@@ -582,6 +586,111 @@ function getRoomData(roomId) {
   return mediasoupRoom.get(roomId);
 }
 
+function getTransportRecord(roomData, transportId, socketId) {
+  if (!roomData || !transportId) {
+    return null;
+  }
+
+  const record = roomData.transports.get(transportId) || null;
+  if (!record) {
+    return null;
+  }
+
+  if (socketId && record.socketId !== socketId) {
+    return null;
+  }
+
+  return record;
+}
+
+function listRoomProducers(roomData) {
+  const producers = [];
+  if (!roomData) {
+    return producers;
+  }
+
+  for (const [producerUserId, producerGroup] of roomData.producers.entries()) {
+    const group = producerGroup || {};
+    for (const [kind, producer] of Object.entries(group)) {
+      if (producer && !producer.closed) {
+        producers.push({ userId: producerUserId, kind, producerId: producer.id });
+      }
+    }
+  }
+
+  return producers;
+}
+
+function closeConsumersForUser(roomId, userId) {
+  const roomData = getRoomData(roomId);
+  if (!roomData) {
+    return;
+  }
+
+  const consumers = roomData.consumers.get(userId);
+  if (!consumers) {
+    return;
+  }
+
+  for (const consumer of consumers.values()) {
+    try {
+      consumer.close();
+    } catch {}
+  }
+
+  roomData.consumers.delete(userId);
+}
+
+function closeProducersForUser(roomId, userId) {
+  const roomData = getRoomData(roomId);
+  if (!roomData) {
+    return;
+  }
+
+  const producers = roomData.producers.get(userId);
+  if (!producers) {
+    return;
+  }
+
+  for (const [kind, producer] of Object.entries(producers)) {
+    if (!producer || producer.closed) {
+      continue;
+    }
+
+    try {
+      producer.close();
+    } catch {}
+
+    io.to(roomId).emit('mediasoup:producer-closed', {
+      roomId,
+      userId,
+      kind,
+      producerId: producer.id,
+    });
+  }
+
+  roomData.producers.delete(userId);
+}
+
+function closeTransportsForSocket(roomId, socketId) {
+  const roomData = getRoomData(roomId);
+  if (!roomData) {
+    return;
+  }
+
+  for (const [transportId, record] of roomData.transports.entries()) {
+    if (record.socketId !== socketId) {
+      continue;
+    }
+
+    try {
+      record.transport.close();
+    } catch {}
+
+    roomData.transports.delete(transportId);
+  }
+}
+
 /**
  * Limpiar una sala de mediasoup cuando se vacía
  */
@@ -591,8 +700,8 @@ async function cleanupRoom(roomId) {
 
   try {
     // Cerrar todos los transportes
-    for (const transport of roomData.transports.values()) {
-      await transport.close();
+    for (const record of roomData.transports.values()) {
+      await record.transport.close();
     }
 
     // El router se cerrará automáticamente cuando todos los recursos se liberen
@@ -728,6 +837,15 @@ function leaveRoom(socket, payload = {}, notifySelf = true) {
   }
 
   broadcastParticipants(roomId);
+
+  closeConsumersForUser(roomId, userId);
+  closeProducersForUser(roomId, userId);
+  closeTransportsForSocket(roomId, socket.id);
+
+  const participantsAfterLeave = getRoomParticipants(roomId);
+  if (participantsAfterLeave.length === 0) {
+    cleanupRoom(roomId);
+  }
 
   socket.data.roomId = null;
   socket.data.userId = null;
@@ -1411,24 +1529,34 @@ io.on('connection', (socket) => {
   });
 
   socket.on('mediasoup:create-transport', async (payload, callback) => {
-    const { roomId, userId } = payload;
+    const { roomId, userId, direction } = payload;
     if (!roomId || !userId) {
       return callback({ error: 'roomId y userId son requeridos' });
     }
 
+    const normalizedDirection = direction === 'recv' ? 'recv' : 'send';
+
     try {
       const router = await getOrCreateRouter(roomId);
       const roomData = getRoomData(roomId);
+      if (!roomData) {
+        return callback({ error: 'Sala no encontrada' });
+      }
 
       const transport = await router.createWebRtcTransport({
-        listenIps: [{ ip: '127.0.0.1', announcedIp: undefined }],
+        listenIps: [{ ip: MEDIASOUP_LISTEN_IP, announcedIp: MEDIASOUP_ANNOUNCED_IP || undefined }],
         enableUdp: true,
         enableTcp: true,
         preferUdp: true,
       });
 
       // Guardar el transporte
-      roomData.transports.set(socket.id, transport);
+      roomData.transports.set(transport.id, {
+        transport,
+        socketId: socket.id,
+        direction: normalizedDirection,
+        userId: normalizeId(userId),
+      });
 
       const { id, iceParameters, iceCandidates, dtlsParameters } = transport;
 
@@ -1448,6 +1576,7 @@ io.on('connection', (socket) => {
         iceParameters,
         iceCandidates,
         dtlsParameters,
+        direction: normalizedDirection,
       });
     } catch (error) {
       console.error('[Mediasoup] Error creando transporte:', error.message);
@@ -1456,19 +1585,19 @@ io.on('connection', (socket) => {
   });
 
   socket.on('mediasoup:connect-transport', async (payload, callback) => {
-    const { roomId, dtlsParameters } = payload;
-    if (!roomId || !dtlsParameters) {
-      return callback({ error: 'roomId y dtlsParameters son requeridos' });
+    const { roomId, transportId, dtlsParameters } = payload;
+    if (!roomId || !transportId || !dtlsParameters) {
+      return callback({ error: 'roomId, transportId y dtlsParameters son requeridos' });
     }
 
     try {
       const roomData = getRoomData(roomId);
-      const transport = roomData.transports.get(socket.id);
-      if (!transport) {
+      const record = getTransportRecord(roomData, transportId, socket.id);
+      if (!record) {
         return callback({ error: 'Transporte no encontrado' });
       }
 
-      await transport.connect({ dtlsParameters });
+      await record.transport.connect({ dtlsParameters });
       callback({ ok: true });
     } catch (error) {
       console.error('[Mediasoup] Error conectando transporte:', error.message);
@@ -1477,19 +1606,23 @@ io.on('connection', (socket) => {
   });
 
   socket.on('mediasoup:produce', async (payload, callback) => {
-    const { roomId, userId, kind, rtpParameters } = payload;
-    if (!roomId || !userId || !kind || !rtpParameters) {
-      return callback({ error: 'roomId, userId, kind y rtpParameters son requeridos' });
+    const { roomId, transportId, userId, kind, rtpParameters } = payload;
+    if (!roomId || !transportId || !userId || !kind || !rtpParameters) {
+      return callback({ error: 'roomId, transportId, userId, kind y rtpParameters son requeridos' });
     }
 
     try {
       const roomData = getRoomData(roomId);
-      const transport = roomData.transports.get(socket.id);
-      if (!transport) {
+      const record = getTransportRecord(roomData, transportId, socket.id);
+      if (!record) {
         return callback({ error: 'Transporte no encontrado' });
       }
 
-      const producer = await transport.produce({
+      if (record.direction !== 'send') {
+        return callback({ error: 'Transporte no habilitado para producir' });
+      }
+
+      const producer = await record.transport.produce({
         kind,
         rtpParameters,
       });
@@ -1520,13 +1653,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('mediasoup:consume', async (payload, callback) => {
-    const { roomId, userId, producerId, rtpCapabilities } = payload;
-    if (!roomId || !userId || !producerId || !rtpCapabilities) {
-      return callback({ error: 'roomId, userId, producerId y rtpCapabilities son requeridos' });
+    const { roomId, transportId, userId, producerId, rtpCapabilities } = payload;
+    if (!roomId || !transportId || !userId || !producerId || !rtpCapabilities) {
+      return callback({ error: 'roomId, transportId, userId, producerId y rtpCapabilities son requeridos' });
     }
 
     try {
       const roomData = getRoomData(roomId);
+      if (!roomData) {
+        return callback({ error: 'Sala no encontrada' });
+      }
       const router = roomData.router;
 
       // Buscar el productor
@@ -1550,12 +1686,16 @@ io.on('connection', (socket) => {
         return callback({ error: 'No se puede consumir este productor' });
       }
 
-      const transport = roomData.transports.get(socket.id);
-      if (!transport) {
+      const record = getTransportRecord(roomData, transportId, socket.id);
+      if (!record) {
         return callback({ error: 'Transporte no encontrado' });
       }
 
-      const consumer = await transport.consume({
+      if (record.direction !== 'recv') {
+        return callback({ error: 'Transporte no habilitado para consumir' });
+      }
+
+      const consumer = await record.transport.consume({
         producerId,
         rtpCapabilities,
         paused: false,
@@ -1610,6 +1750,17 @@ io.on('connection', (socket) => {
       callback({ error: error.message });
     }
   });
+
+  socket.on('mediasoup:get-producers', (payload, callback) => {
+    const { roomId } = payload || {};
+    if (!roomId) {
+      return callback({ error: 'roomId es requerido' });
+    }
+
+    const roomData = getRoomData(roomId);
+    const producers = listRoomProducers(roomData);
+    callback({ producers });
+  });
   // ========== FIN EVENTOS MEDIASOUP ==========
 
   socket.on('disconnect', () => {
@@ -1617,15 +1768,14 @@ io.on('connection', (socket) => {
 
     // Limpiar recursos de mediasoup
     const roomId = socket.data.roomId;
+    const userId = socket.data.userId;
     if (roomId) {
-      const roomData = getRoomData(roomId);
-      if (roomData) {
-        const transport = roomData.transports.get(socket.id);
-        if (transport) {
-          transport.close().catch(() => {});
-          roomData.transports.delete(socket.id);
-        }
+      if (userId) {
+        closeConsumersForUser(roomId, userId);
+        closeProducersForUser(roomId, userId);
       }
+
+      closeTransportsForSocket(roomId, socket.id);
 
       // Si la sala está vacía, limpiarla
       const participants = getRoomParticipants(roomId);
